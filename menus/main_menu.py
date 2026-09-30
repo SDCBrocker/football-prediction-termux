@@ -3,6 +3,21 @@
 
 Menu ini menjalankan setiap tahap pipeline melalui subprocess agar setiap
 modul berjalan sebagai proses terpisah dan error dapat terlihat jelas.
+
+Menu:
+1. Fetch Data dari API
+2. Clean Data
+3. Feature Engineering
+4. Normalisasi
+5. Training Model
+6. Backtest
+7. Prediksi Hari Ini
+8. Cek Result
+9. Update Database
+10. Kirim ke Telegram
+11. Health Check
+12. Lihat Log
+13. Keluar
 """
 
 import os
@@ -43,11 +58,15 @@ def clear_screen():
 def ensure_directories():
     """Membuat folder kerja yang dibutuhkan sebelum menu dijalankan."""
     for relative_path in (
+        "data/raw",
         "data/raw/cache",
         "data/processed",
         "data/backup",
         "logs",
         "models",
+        "notebooks",
+        "scripts",
+        "menus",
     ):
         (ROOT / relative_path).mkdir(parents=True, exist_ok=True)
 
@@ -97,7 +116,7 @@ def pause():
 
 
 def main():
-    """Loop menu utama sampai pengguna memilih opsi 13."""
+    """Loop menu utama sampai pengguna memilih opsi 13 (Keluar)."""
     ensure_directories()
 
     while True:
