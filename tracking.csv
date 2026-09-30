@@ -1,0 +1,4 @@
+tanggal,match_id,liga,home,away,market,prediksi,confidence,odds,value,hasil,profit,bankroll
+2026-09-30,1001,EPL,Arsenal,Tottenham,1X2,Home,0.76,1.90,0.18,Home,190000,1000000
+2026-09-30,1002,LaLiga,Real Madrid,Barcelona,Over_2_5,Over,0.71,2.10,0.12,Over,210000,1000000
+2026-09-30,1003,SerieA,Juventus,Inter,BTTS,Yes,0.68,1.75,0.10,No,0,1000000
