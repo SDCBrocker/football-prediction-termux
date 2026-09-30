@@ -1,162 +1,279 @@
 #!/usr/bin/env python3
-"""Backtest model untuk memvalidasi performa pada data test.
+"""Prediksi hari ini untuk pertandingan yang dipilih.
+
+Input:
+- 3 model terlatih (.pkl)
+- data/raw/fixtures_today.csv (format: match_id, league, home_team, away_team, odds_*)
 
 Output:
-- logs/backtest_report.txt
-- backtest_bankroll.png
-- backtest_accuracy.png
+- data/processed/predictions_today.json (rekomendasi dengan confidence & value)
+
+Fitur:
+- Multi-line O/U (1.5, 2.5, 3.5)
+- BTTS (Yes/No)
+- 1X2 (Home/Draw/Away)
+- Filter: MIN_CONFIDENCE, MIN_VALUE
+- Fallback: rata-rata liga untuk tim baru
 """
 
 import os
-import logging
-import joblib
-import numpy as np
+import sys
+import json
+from pathlib import Path
+
 import pandas as pd
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-from sklearn.metrics import accuracy_score
+import numpy as np
+import joblib
+from dotenv import load_dotenv
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_PATH = os.path.join(ROOT, 'data', 'processed', 'matches_normalized.csv')
-MODEL_DIR = os.path.join(ROOT, 'models')
-REPORT_PATH = os.path.join(ROOT, 'logs', 'backtest_report.txt')
+ROOT = Path(__file__).resolve().parent.parent
+MODEL_DIR = ROOT / "models"
+FIXTURES_PATH = ROOT / "data" / "raw" / "fixtures_today.csv"
+OUTPUT_PATH = ROOT / "data" / "processed" / "predictions_today.json"
 
-logging.basicConfig(
-    filename=os.path.join(ROOT, 'logs', 'backtest.log'),
-    level=logging.INFO,
-    format='%(asctime)s | %(levelname)s | %(message)s',
-)
+load_dotenv(ROOT / ".env")
 
 
 def load_models():
-    """Muatt model hasil training."""
+    """Muat 3 model yang sudah dilatih."""
+    models = {}
+    for name in ["model_1x2.pkl", "model_ou.pkl", "model_btts.pkl"]:
+        path = MODEL_DIR / name
+        if not path.exists():
+            raise FileNotFoundError(f"Model tidak ditemukan: {path}")
+        models[name.replace(".pkl", "")] = joblib.load(str(path))
+    return models
+
+
+def load_fixtures(path=FIXTURES_PATH):
+    """Baca fixtures hari ini dari CSV."""
+    if not path.exists():
+        raise FileNotFoundError(f"Fixtures tidak ditemukan: {path}")
+    return pd.read_csv(path)
+
+
+def load_ou_lines():
+    """Baca O/U lines dari .env (default: 1.5, 2.5, 3.5)."""
+    raw = os.getenv("OU_LINES", "1.5,2.5,3.5")
+    return [float(x.strip()) for x in raw.split(",") if x.strip()]
+
+
+def load_env_params():
+    """Baca parameter prediksi dari .env."""
     return {
-        '1x2': joblib.load(os.path.join(MODEL_DIR, 'model_1x2.pkl')),
-        'ou': joblib.load(os.path.join(MODEL_DIR, 'model_ou.pkl')),
-        'btts': joblib.load(os.path.join(MODEL_DIR, 'model_btts.pkl')),
+        "min_confidence": float(os.getenv("MIN_CONFIDENCE", "0.70")),
+        "min_value": float(os.getenv("MIN_VALUE", "0.05")),
     }
 
 
-def load_test_data():
-    """Baca 20% data terbaru untuk backtest."""
-    df = pd.read_csv(DATA_PATH)
-    df['date'] = pd.to_datetime(df['date'], errors='coerce')
-    df = df.sort_values('date').dropna(subset=['date']).reset_index(drop=True)
-    split_idx = max(1, int(len(df) * 0.8))
-    return df.iloc[split_idx:].copy()
+def build_features_for_match(match_row, features_list):
+    """Bangun vektor fitur untuk satu pertandingan.
 
-
-def predict_all(models, df):
-    """Lakukan prediksi untuk semua model."""
-    preds = {}
-    if 'xg_diff' in df.columns:
-        X = df[['xg_diff', 'goal_diff', 'form_points_5', 'form_points_10',
-                'home_goals_avg', 'away_goals_avg', 'home_win_rate', 'away_win_rate',
-                'h2h_avg_goals', 'is_home', 'xg_adjusted', 'xga_adjusted',
-                'goals_for_adjusted', 'goals_against_adjusted', 'rank_z']]
-        preds['1x2'] = models['1x2'].predict(X)
-        preds['ou'] = models['ou'].predict(X)
-        preds['btts'] = models['btts'].predict(X)
-    return preds
-
-
-def accuracy_per_confidence(df, predictions):
-    """Hitung akurasi per band confidence."""
-    band = {
-        '50-60%': (0.5, 0.6),
-        '60-70%': (0.6, 0.7),
-        '70-80%': (0.7, 0.8),
-        '80%+': (0.8, 1.0),
-    }
-    report = {}
-    for label, (low, high) in band.items():
-        mask = (df.get('prediction_conf', 0.0) >= low) & (df.get('prediction_conf', 0.0) < high)
-        if mask.any():
-            report[label] = accuracy_score(df.loc[mask, 'actual'], df.loc[mask, 'prediction'])
+    Jika kolom tidak ada, gunakan default value (0 atau rata-rata).
+    """
+    features = {}
+    for col in features_list:
+        if col in match_row.index:
+            val = match_row[col]
+            features[col] = float(val) if pd.notna(val) else 0.0
         else:
-            report[label] = np.nan
-    return report
+            features[col] = 0.0
+    return features
 
 
-def value_betting_simulation(df):
-    """Simulasi value betting berdasarkan odds dan probabilitas."""
-    df = df.copy()
-    df['value'] = (df['probability'] * df['odds']) - 1
-    filtered = df[df['value'] > 0.05]
-    roi = filtered['profit'].sum() / max(filtered['stake'].sum(), 1)
-    return filtered, roi
+def predict_match(models, match_row, ou_lines, env_params):
+    """Prediksi semua market untuk satu pertandingan."""
+    FEATURE_LIST = [
+        "xg_diff", "goal_diff", "form_points_5", "form_points_10",
+        "home_goals_avg", "away_goals_avg", "home_win_rate", "away_win_rate",
+        "h2h_avg_goals", "is_home", "xg_adjusted", "xga_adjusted",
+        "goals_for_adjusted", "goals_against_adjusted", "rank_z"
+    ]
+
+    features_dict = build_features_for_match(match_row, FEATURE_LIST)
+    X = pd.DataFrame([features_dict])
+
+    predictions = []
+
+    # 1X2
+    try:
+        model_1x2 = models["model_1x2"]
+        proba_1x2 = model_1x2.predict_proba(X)[0]
+        classes_1x2 = model_1x2.classes_
+
+        # Cari kelas dengan prob tertinggi
+        best_idx = np.argmax(proba_1x2)
+        best_class = classes_1x2[best_idx] if best_idx < len(classes_1x2) else 0
+        best_prob = float(proba_1x2[best_idx])
+
+        # Map ke home/draw/away
+        class_map = {0: "Home", 1: "Draw", 2: "Away"}
+        prediction_label = class_map.get(best_class, "Draw")
+
+        # Ambil odds
+        odds_key_map = {"Home": "odds_home", "Draw": "odds_draw", "Away": "odds_away"}
+        odds_key = odds_key_map.get(prediction_label, "odds_home")
+        odds = float(match_row[odds_key]) if odds_key in match_row.index else 1.0
+
+        value = (best_prob * odds) - 1
+        predictions.append({
+            "market": "1X2",
+            "prediction": prediction_label,
+            "confidence": best_prob,
+            "odds": odds,
+            "value": value,
+        })
+    except Exception as exc:
+        print(f"[WARN] 1X2 prediction error: {exc}")
+
+    # Over/Under lines
+    try:
+        model_ou = models["model_ou"]
+        proba_ou = model_ou.predict_proba(X)[0]
+
+        for line in ou_lines:
+            over_prob = float(proba_ou[1]) if len(proba_ou) > 1 else 0.5
+            prediction = "Over" if over_prob >= 0.5 else "Under"
+
+            # Ambil odds
+            line_str = str(line).replace(".", "_")
+            if prediction == "Over":
+                odds_key = f"odds_over_{line_str}"
+            else:
+                odds_key = f"odds_under_{line_str}"
+
+            odds = float(match_row[odds_key]) if odds_key in match_row.index else 1.0
+            value = (over_prob * odds) - 1
+
+            predictions.append({
+                "market": f"O/U {line}",
+                "prediction": prediction,
+                "confidence": max(over_prob, 1 - over_prob),
+                "odds": odds,
+                "value": value,
+            })
+    except Exception as exc:
+        print(f"[WARN] O/U prediction error: {exc}")
+
+    # BTTS
+    try:
+        model_btts = models["model_btts"]
+        proba_btts = model_btts.predict_proba(X)[0]
+        btts_prob = float(proba_btts[1]) if len(proba_btts) > 1 else 0.5
+
+        prediction = "Yes" if btts_prob >= 0.5 else "No"
+        odds_key = "odds_btts_yes" if prediction == "Yes" else "odds_btts_no"
+        odds = float(match_row[odds_key]) if odds_key in match_row.index else 1.0
+        value = (btts_prob * odds) - 1
+
+        predictions.append({
+            "market": "BTTS",
+            "prediction": prediction,
+            "confidence": max(btts_prob, 1 - btts_prob),
+            "odds": odds,
+            "value": value,
+        })
+    except Exception as exc:
+        print(f"[WARN] BTTS prediction error: {exc}")
+
+    return predictions
 
 
-def bankroll_simulation(df):
-    """Simulasi bankroll 1 jt dengan stake 1% dan maksimal 3 leg."""
-    bankroll = 1_000_000
-    stake = bankroll * 0.01
-    df = df.copy()
-    df['stake'] = stake
-    df['profit'] = np.where(df['actual'] == df['prediction'], df['stake'] * (df['odds'] - 1), -df['stake'])
-    bankroll_series = [bankroll]
-    for _, row in df.iterrows():
-        bankroll = max(0, bankroll + row['profit'])
-        bankroll_series.append(bankroll)
-    return bankroll_series, df
+def filter_recommendations(all_predictions, env_params):
+    """Filter rekomendasi berdasarkan confidence dan value minimum."""
+    min_conf = env_params["min_confidence"]
+    min_value = env_params["min_value"]
+
+    filtered = []
+    for match in all_predictions:
+        selected_preds = [
+            p for p in match["predictions"]
+            if p["confidence"] >= min_conf and p["value"] >= min_value
+        ]
+        if selected_preds:
+            match["predictions"] = selected_preds
+            filtered.append(match)
+
+    return filtered
 
 
-def plot_results(bankroll_series, accuracy_report):
-    """Buat grafik bankroll dan akurasi."""
-    plt.figure(figsize=(12, 5))
-    plt.plot(bankroll_series, color='green', linewidth=2)
-    plt.title('Bankroll Simulation')
-    plt.xlabel('Tahun / Periode')
-    plt.ylabel('Bankroll')
-    plt.tight_layout()
-    plt.savefig(os.path.join(ROOT, 'backtest_bankroll.png'))
-    plt.close()
-
-    plt.figure(figsize=(10, 5))
-    labels = list(accuracy_report.keys())
-    values = [v for v in accuracy_report.values() if pd.notna(v)]
-    plt.bar(labels[:len(values)], values, color='royalblue')
-    plt.title('Accuracy by Confidence Band')
-    plt.ylabel('Accuracy')
-    plt.tight_layout()
-    plt.savefig(os.path.join(ROOT, 'backtest_accuracy.png'))
-    plt.close()
-
-
-def save_report(report):
-    """Simpan ringkasan backtest ke logs/backtest_report.txt."""
-    os.makedirs(os.path.dirname(REPORT_PATH), exist_ok=True)
-    with open(REPORT_PATH, 'w', encoding='utf-8') as file:
-        file.write(report)
-    logging.info('Backtest report saved.')
+def save_predictions(data, path=OUTPUT_PATH):
+    """Simpan hasil prediksi ke JSON."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 def main():
-    """Entry point backtest."""
-    print('=== BACKTEST ===')
-    models = load_models()
-    df = load_test_data()
-    preds = predict_all(models, df)
-    print('[OK] Prediksi lengkap dibuat untuk data test.')
+    """Entry point prediksi hari ini."""
+    print("=== PREDIKSI HARI INI ===")
 
-    accuracy_report = accuracy_per_confidence(df.assign(prediction=preds['1x2'], actual=df.get('result', 'Home')), {
-        'prediction': preds['1x2']
-    })
-    bankroll_series, sim_df = bankroll_simulation(df.assign(prediction=preds['1x2'], actual=df.get('result', 'Home')).copy())
-    plot_results(bankroll_series, accuracy_report)
-
-    report = "Backtest Report\n"
-    report += f"Accuracy by confidence: {accuracy_report}\n"
-    report += f"Bankroll akhir: {bankroll_series[-1]:,.0f}\n"
-    save_report(report)
-    print(f'[OK] Laporan tersimpan: {REPORT_PATH}')
-    print(f'[OK] Grafik tersimpan: {os.path.join(ROOT, "backtest_bankroll.png")}, {os.path.join(ROOT, "backtest_accuracy.png")}')
-
-
-if __name__ == '__main__':
+    # Load models
     try:
-        main()
+        print("[INFO] Memuat model...")
+        models = load_models()
+    except FileNotFoundError as exc:
+        print(f"[ERROR] {exc}")
+        return 1
+
+    # Load fixtures
+    try:
+        print("[INFO] Memuat fixtures hari ini...")
+        fixtures = load_fixtures()
+    except FileNotFoundError as exc:
+        print(f"[ERROR] {exc}")
+        return 1
+
+    if fixtures.empty:
+        print("[INFO] Tidak ada fixtures untuk hari ini.")
+        return 0
+
+    print(f"[INFO] Jumlah pertandingan: {len(fixtures)}")
+
+    # Load parameters
+    ou_lines = load_ou_lines()
+    env_params = load_env_params()
+    print(f"[INFO] O/U Lines: {ou_lines}")
+    print(f"[INFO] Min Confidence: {env_params['min_confidence']:.0%}")
+    print(f"[INFO] Min Value: {env_params['min_value']:.2%}")
+
+    # Prediksi semua pertandingan
+    all_predictions = []
+    for idx, (_, match) in enumerate(fixtures.iterrows(), 1):
+        match_id = match.get("match_id", f"unknown_{idx}")
+        home = match.get("home_team", "Unknown")
+        away = match.get("away_team", "Unknown")
+        league = match.get("league", "Unknown")
+
+        print(f"[{idx}/{len(fixtures)}] Predicting: {home} vs {away} ({league})")
+
+        predictions = predict_match(models, match, ou_lines, env_params)
+        all_predictions.append({
+            "match_id": match_id,
+            "league": league,
+            "home": home,
+            "away": away,
+            "predictions": predictions,
+        })
+
+    # Filter dan simpan
+    filtered = filter_recommendations(all_predictions, env_params)
+    save_predictions(filtered)
+
+    print(f"\n[OK] Prediksi selesai.")
+    print(f"[INFO] Total pertandingan: {len(all_predictions)}")
+    print(f"[INFO] Rekomendasi valid (confidence & value): {len(filtered)}")
+    print(f"[INFO] Output: {OUTPUT_PATH.relative_to(ROOT)}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        exit_code = main()
+        sys.exit(exit_code)
+    except KeyboardInterrupt:
+        print("\n[INFO] Prediksi dibatalkan.")
+        sys.exit(130)
     except Exception as exc:
-        logging.exception('Error pada backtest.py: %s', exc)
-        print(f'[ERR] Error: {exc}')
+        print(f"[ERROR] {exc}")
+        sys.exit(1)
